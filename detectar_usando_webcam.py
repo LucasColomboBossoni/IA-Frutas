@@ -1,70 +1,89 @@
+from flask import Flask, jsonify, render_template, Response, request
 from ultralytics import YOLO
 import cv2
-from collections import defaultdict
-import numpy as np
 
-# origens possíveis: image, screenshot, URL, video, YouTube, Streams -> ESP32 / Intelbras / Cameras On-Line
-# mais informações em https://docs.ultralytics.com/modes/predict/#inference-sources
+app = Flask(__name__)
 
-cap = cv2.VideoCapture(0)
-#cap = cv2.VideoCapture(1, cv2.CAP_DSHOW)
+model = YOLO("C:/Users/Lucas Colombo/runs/detect/train34/weights/best.pt")
 
-# Usa modelo da Yolo
-# Model	    size    mAPval  Speed       Speed       params  FLOPs
-#           (pixels) 50-95  CPU ONNX A100 TensorRT   (M)     (B)
-#                           (ms)        (ms)
-# YOLOv8n	640	    37.3	80.4	    0.99	    3.2	    8.7
-# YOLOv8s	640	    44.9	128.4	    1.20	    11.2	28.6
-# YOLOv8m	640	    50.2	234.7	    1.83	    25.9	78.9
-# YOLOv8l	640	    52.9	375.2	    2.39	    43.7	165.2
-# YOLOv8x	640	    53.9	479.1	    3.53	    68.2	257.8
+cap = None
+is_system_on = False
 
-model = YOLO("yolov8n.pt")
+@app.route('/')
+def index():
+    return render_template('index.html')
 
-track_history = defaultdict(lambda: [])
-seguir = True
-deixar_rastro = True
 
-while True:
+@app.route('/deteccoes', methods=['GET'])
+def get_detections():
+    global is_system_on, cap
+    if not is_system_on:
+        return jsonify([])  
+
     success, img = cap.read()
-
     if success:
-        if seguir:
-            results = model.track(img, persist=True)
-        else:
-            results = model(img)
+        
+        results = model(img)
+        detections = []
 
-        # Process results list
+
         for result in results:
-            # Visualize the results on the frame
-            img = result.plot()
+            boxes = result.boxes  
 
-            if seguir and deixar_rastro:
-                try:
-                    # Get the boxes and track IDs
-                    boxes = result.boxes.xywh.cpu()
-                    track_ids = result.boxes.id.int().cpu().tolist()
 
-                    # Plot the tracks
-                    for box, track_id in zip(boxes, track_ids):
-                        x, y, w, h = box
-                        track = track_history[track_id]
-                        track.append((float(x), float(y)))  # x, y center point
-                        if len(track) > 30:  # retain 90 tracks for 90 frames
-                            track.pop(0)
+            for box in boxes:
+                cls = box.cls[0]  
+                conf = box.conf[0] 
 
-                        # Draw the tracking lines
-                        points = np.hstack(track).astype(np.int32).reshape((-1, 1, 2))
-                        cv2.polylines(img, [points], isClosed=False, color=(230, 0, 0), thickness=5)
-                except:
-                    pass
 
-        cv2.imshow("Tela", img)
+                class_name = model.names[int(cls)]
 
-    k = cv2.waitKey(1)
-    if k == ord('q'):
-        break
 
-cap.release()
-cv2.destroyAllWindows()
-print("desligando")
+                detections.append({
+                    'class': class_name,
+                    'confidence': float(conf),
+                    'box': box.xyxy[0].tolist()
+                })
+
+        return jsonify(detections)
+    else:
+        return jsonify({'error': 'Erro ao capturar a imagem'}), 500
+
+def generate_frames():
+    global cap
+    while is_system_on:
+        success, frame = cap.read()
+        if not success:
+            break
+        else:
+            ret, buffer = cv2.imencode('.jpg', frame)
+            frame = buffer.tobytes()
+
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+
+@app.route('/video_feed')
+def video_feed():
+    if not is_system_on:
+        return '', 204  
+    return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+@app.route('/toggle_system', methods=['POST'])
+def toggle_system():
+    global is_system_on, cap
+    action = request.json.get('action')
+
+    if action == "on":
+        if not is_system_on:
+            cap = cv2.VideoCapture(0) 
+            is_system_on = True
+    elif action == "off":
+        if is_system_on:
+            is_system_on = False
+            cap.release() 
+            cap = None
+
+    return jsonify({'status': 'on' if is_system_on else 'off'})
+
+if __name__ == '__main__':
+    app.run(debug=True)
